@@ -1,9 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Cancel R1 during a real CPU load; verify shared KV protection and R2 cleanup.
-
-Simplified from the October 7 experiment. Model output is synthetic; a pending
-CUDA event proves an unfinished transfer, not active DMA at cancellation time.
 """
 
 import time
