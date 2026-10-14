@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Cancel R1 during a real CPU load; verify shared KV protection and R2 cleanup.
+
+Simplified from the October 7 experiment. Model output is synthetic; a pending
+CUDA event proves an unfinished transfer, not active DMA at cancellation time.
 """
 
 import time
@@ -123,3 +126,169 @@ def test_cancel_loader_while_same_prefix_request_waits(
             finished_recving=receiving,
             kv_connector_worker_meta=aggregate,
         )
+
+    def report(output, wait_for=(), require_pending=False, wait_stores=False):
+        actual = collect_step(
+            output,
+            wait_for=wait_for,
+            require_pending=require_pending,
+            wait_stores=wait_stores,
+        )
+        scheduler.update_from_output(
+            output, ModelRunnerOutput.with_kv_conn_output_only(actual)
+        )
+
+    # 2. Seed CPU KV for a 12-token prefix plus one uncached token.
+    prompt = list(range(13))
+    runner.new_request(token_ids=prompt)
+    r1 = str(runner.req_id)
+    state = connector._req_status[r1]
+    state.update_offload_keys()
+    keys = state.group_states[0].offload_keys[:1]
+    assert len(keys) == 1
+    seed = ReqContext(req_id="seed")
+    manager.on_new_request(seed)
+    stored = manager.prepare_store(keys, seed)
+    assert stored is not None
+    assert worker.submit_store(
+        -1,
+        GPULoadStoreSpec([97, 98, 99], group_sizes=(3,), block_indices=(0,)),
+        stored.store_spec,
+    )
+    await_jobs({-1})
+    assert results[-1].transfer_size == 3 * page_bytes
+    cpu_before = worker._load_handler.src_tensors[0].clone()
+    assert torch.equal(cpu_before.reshape(-1), expected)
+    gpu.zero_()
+    manager.complete_store(stored.keys_to_store, seed)
+    manager.on_request_finished(seed)
+    torch.cuda._sleep(1)
+    torch.cuda.synchronize()
+
+    # 3. Start R1 loading; R2 must wait on the same prefix.
+    first = scheduler.schedule()
+    assert not first.num_scheduled_tokens
+    loads = first.kv_connector_metadata.load_jobs
+    assert len(loads) == 1
+    job_id = next(iter(loads))
+    assert connector._jobs[job_id].req_id == r1
+    chunk = manager._policy.get(keys[0])
+    assert chunk is not None and chunk.ref_cnt == 1
+    report(first, require_pending=True)
+    runner.new_request(token_ids=prompt)
+    r2 = str(runner.req_id)
+    waiting = scheduler.schedule()
+    assert not waiting.num_scheduled_tokens
+    assert not waiting.kv_connector_metadata.load_jobs
+    assert r2 in scheduler.requests
+    assert keys[0] in connector._chunks_being_loaded
+    assert chunk.ref_cnt == 1
+    report(waiting, require_pending=True)
+    print("R2 waits without issuing a duplicate load: PASS")
+    pressure_key = make_offload_key(b"pressure-only", 0)
+
+    def check_pressure_blocked(label):
+        ctx = ReqContext(req_id=label)
+        manager.on_new_request(ctx)
+        assert manager.prepare_store([pressure_key], ctx) is None
+        manager.on_request_finished(ctx)
+        assert manager._policy.get(keys[0]) is chunk
+        assert chunk.ref_cnt == 1
+        assert manager._policy.get(pressure_key) is None
+        print(f"{label}: in-flight chunk protected")
+
+    # 4. Cancel R1 while its transfer is pending; pressure must not evict KV.
+    check_pressure_blocked("before-cancel")
+    end_event = load_end_events[job_id]
+    if end_event.query():
+        pytest.skip(
+            "INCONCLUSIVE: R1 load finished before cancellation; pending-transfer timing was not established"
+        )
+    scheduler.finish_requests((r1,), RequestStatus.FINISHED_ABORTED)
+    if end_event.query():
+        pytest.skip(
+            "INCONCLUSIVE: R1 load finished during cancellation; pending state after cancellation was not established"
+        )
+    print("R1 load end event pending before AND after cancellation: PASS")
+    assert r1 in scheduler.requests
+    assert r2 in scheduler.requests
+    assert not scheduler.requests[r2].is_finished()
+    assert chunk.ref_cnt == 1
+    assert job_id in connector._jobs
+    print("R1 cancellation preserves the in-flight load: PASS")
+    check_pressure_blocked("after-cancel")
+
+    # 5. Finish the transfer and release R1.
+    pending = scheduler.schedule()
+    assert not pending.num_scheduled_tokens
+    assert not pending.kv_connector_metadata.load_jobs
+    report(pending, wait_for={job_id})
+    # The actual load must restore the seeded bytes to the scheduled GPU blocks.
+    loaded_blocks = first.kv_connector_metadata.load_jobs[job_id].dst_spec.block_ids
+    for offset, block_id in enumerate(loaded_blocks):
+        assert torch.equal(
+            gpu[int(block_id)].cpu(), expected.reshape(3, page_bytes)[offset]
+        )
+    assert torch.equal(worker._load_handler.src_tensors[0], cpu_before)
+    assert job_id not in connector._jobs
+    assert chunk.ref_cnt == 0
+    assert keys[0] not in connector._chunks_being_loaded
+    assert r1 not in scheduler.requests
+    print("R1 completion releases its load reference: PASS")
+
+    # 6. Resume R2, emit EOS, then drain pending stores and request state.
+    for _ in range(4):
+        output = scheduler.schedule()
+        loads = output.kv_connector_metadata.load_jobs
+        if output.num_scheduled_tokens.get(r2, 0) > 0:
+            assert not loads
+            assert r1 not in connector._req_status
+            assert chunk.ref_cnt == 0
+            print("R2 resumes model execution: PASS")
+            assert not output.kv_connector_metadata.store_jobs
+            survivor = scheduler.requests[r2]
+            actual = collect_step(output)
+            model_output = create_model_runner_output(
+                reqs=scheduler.running,
+                finished_sending=actual.finished_sending,
+                finished_recving=actual.finished_recving,
+                token_id=EOS_TOKEN_ID,
+                kv_connector_worker_meta=actual.kv_connector_worker_meta,
+            )
+            scheduler.update_from_output(output, model_output)
+            assert survivor.is_finished()
+            assert survivor.status != RequestStatus.FINISHED_ABORTED
+            for _ in range(8):
+                drained = scheduler.schedule()
+                assert not drained.num_scheduled_tokens
+                assert not drained.kv_connector_metadata.load_jobs
+                for job in connector._jobs.values():
+                    assert job.is_store, "Unexpected unfinished load"
+                report(drained, wait_stores=True)
+                if (
+                    not scheduler.requests
+                    and (not scheduler.finished_req_ids)
+                    and (not connector._jobs)
+                    and (not connector._req_status)
+                ):
+                    break
+            else:
+                raise AssertionError("Request/job state did not drain")
+            assert not connector._chunks_being_loaded
+            assert not connector._block_id_to_pending_jobs
+            assert not connector.has_pending_push_work()
+            assert manager._num_write_pending_chunks == 0
+            resident_count = manager._num_allocated_chunks - len(manager._free_list)
+            assert resident_count == manager._num_evictable_cache_chunks
+            assert not worker_connector._load_jobs
+            assert not worker_connector._unsubmitted_store_jobs
+            assert worker_connector.build_connector_worker_meta() is None
+            assert not worker._load_handler._transfer_events
+            assert not worker._store_handler._transfer_events
+            print("R2 EOS: request/job cleanup and CPU unpinning PASS")
+            return
+        assert not output.num_scheduled_tokens
+        for jid in loads:
+            assert connector._jobs[jid].req_id == r2
+        report(output, wait_for=set(loads))
+    raise AssertionError("R2 did not resume within four controlled steps")
