@@ -21,16 +21,31 @@ from vllm.v1.kv_offload.base import (
     ReqContext,
     make_offload_key,
 )
+from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
+    swap_blocks_batch as triton_swap_blocks_batch,
+)
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
 
+@pytest.mark.parametrize("pin_memory", [False, True])
 @pytest.mark.parametrize("async_scheduling", [False, True])
 def test_cancel_loader_while_same_prefix_request_waits(
-    request_runner, async_scheduling, request
+    request_runner, async_scheduling, pin_memory, request, monkeypatch
 ):
+    _run_cancel_scenario(
+        request_runner, async_scheduling, request, monkeypatch, pin_memory
+    )
+
+
+def _run_cancel_scenario(
+    request_runner, async_scheduling, request, monkeypatch, pin_memory, mutation=None
+):
+    # Small pinned loads use Triton when supported; otherwise they fall back to C++.
+    # Both memory modes are tested for chunk protection and lifecycle.
+    monkeypatch.setattr("vllm.v1.kv_offload.cpu.gpu_worker.PIN_MEMORY", pin_memory)
     runner = request_runner(
         block_size=4,
         blocks_per_chunk=3,
@@ -61,10 +76,12 @@ def test_cancel_loader_while_same_prefix_request_waits(
     assert worker_connector is not None
     worker_connector.worker = worker
     request.addfinalizer(worker_connector.shutdown)
+    if worker._load_handler.src_tensors[0].is_pinned() != pin_memory:
+        pytest.skip(f"Could not allocate CPU buffer with pin_memory={pin_memory}")
     load_end_events = {}
     results = {}
 
-    # Wait for transfer-engine completions
+    # Wait until the copy worker finishes the given jobs (seed store, warm-up load)
     def await_jobs(job_ids):
         deadline = time.monotonic() + 10
         while not set(job_ids) <= results.keys():
@@ -82,7 +99,7 @@ def test_cancel_loader_while_same_prefix_request_waits(
     def collect_step(output, wait_for=(), require_pending=False, wait_stores=False):
         metadata = output.kv_connector_metadata
         assert not metadata.jobs_to_flush
-        # Delay the GPU so R1's load is still running at cancellation
+        # Stall the GPU so R1's load is still in flight when R1 is canceled
         if any(job.req_id == r1 for job in metadata.load_jobs.values()):
             torch.cuda._sleep(500000000)
         worker_connector.handle_preemptions(metadata)
@@ -104,7 +121,7 @@ def test_cancel_loader_while_same_prefix_request_waits(
             sending.update(sent)
             receiving.update(received)
             meta = worker_connector.build_connector_worker_meta()
-            # Skip if a completion arrives before the cancellation window
+            # Skip if the load finished too early
             if require_pending and (sent or received or meta is not None):
                 pytest.skip("Completion arrived before the cancellation window")
             if meta is not None:
@@ -124,7 +141,20 @@ def test_cancel_loader_while_same_prefix_request_waits(
             kv_connector_worker_meta=aggregate,
         )
 
-    # Run one worker step and return its output to the scheduler
+    # Async scheduling applies step N's output only after step N+1 is scheduled. 
+    # Model this by holding outputs until the next schedule().
+    held = []
+
+    def flush():
+        while held:
+            scheduler.update_from_output(*held.pop(0))
+
+    def schedule():
+        output = scheduler.schedule()
+        flush()
+        return output
+
+    # Run one worker step and return its output to the scheduler (held if async)
     def report(output, wait_for=(), require_pending=False, wait_stores=False):
         actual = collect_step(
             output,
@@ -132,9 +162,11 @@ def test_cancel_loader_while_same_prefix_request_waits(
             require_pending=require_pending,
             wait_stores=wait_stores,
         )
-        scheduler.update_from_output(
-            output, ModelRunnerOutput.with_kv_conn_output_only(actual)
-        )
+        model_output = ModelRunnerOutput.with_kv_conn_output_only(actual)
+        if async_scheduling:
+            held.append((output, model_output))
+        else:
+            scheduler.update_from_output(output, model_output)
 
     # 1. Seed the CPU with a known pattern, then clear the GPU
     prompt = list(range(13))
@@ -157,13 +189,24 @@ def test_cancel_loader_while_same_prefix_request_waits(
     assert results[-1].transfer_size == 3 * page_bytes
     cpu_before = worker._load_handler.src_tensors[0].clone()
     assert torch.equal(cpu_before.reshape(-1), expected)
-    gpu.zero_()
     manager.complete_store(stored.keys_to_store, seed)
     manager.on_request_finished(seed)
+    # Warm up the load path so kernel compilation cannot outlast the GPU stall
+    warm = ReqContext(req_id="warmup")
+    manager.on_new_request(warm)
+    src = manager.prepare_load(keys, warm)
+    assert worker.submit_load(
+        -2, src, GPULoadStoreSpec([0, 1, 2], group_sizes=(3,), block_indices=(0,))
+    )
+    await_jobs({-2})
+    assert torch.equal(gpu[0:3].cpu().reshape(-1), expected)
+    manager.complete_load(keys, warm)
+    manager.on_request_finished(warm)
+    gpu.zero_()
     torch.cuda.synchronize()
 
     # 2. Schedule R1: one load job, chunk referenced once
-    first = scheduler.schedule()
+    first = schedule()
     assert not first.num_scheduled_tokens
     loads = first.kv_connector_metadata.load_jobs
     assert len(loads) == 1
@@ -176,7 +219,7 @@ def test_cancel_loader_while_same_prefix_request_waits(
     # 3. Add R2 with the same prompt: it waits without a duplicate load
     runner.new_request(token_ids=prompt)
     r2 = str(runner.req_id)
-    waiting = scheduler.schedule()
+    waiting = schedule()
     assert not waiting.num_scheduled_tokens
     assert not waiting.kv_connector_metadata.load_jobs
     assert r2 in scheduler.requests
@@ -190,7 +233,9 @@ def test_cancel_loader_while_same_prefix_request_waits(
     def check_pressure_blocked(label):
         ctx = ReqContext(req_id=label)
         manager.on_new_request(ctx)
-        assert manager.prepare_store([pressure_key], ctx) is None
+        assert manager.prepare_store([pressure_key], ctx) is None, (
+            f"{label}: pressure store evicted the in-flight chunk"
+        )
         manager.on_request_finished(ctx)
         assert manager._policy.get(keys[0]) is chunk
         assert chunk.ref_cnt == 1
@@ -206,33 +251,54 @@ def test_cancel_loader_while_same_prefix_request_waits(
     scheduler.finish_requests((r1,), RequestStatus.FINISHED_ABORTED)
     if end_event.query():
         pytest.skip("R1 load finished during cancellation")
+    # Fault injection for negative-control tests
+    if mutation is not None:
+        mutation(manager=manager, worker=worker, state=state, keys=keys, job_id=job_id)
+    # Behavioral check first: pressure must not evict the in-flight chunk
+    check_pressure_blocked("after-cancel")
     # R1 removal is deferred and the chunk stays protected
     assert r1 in scheduler.requests
     assert r2 in scheduler.requests
     assert not scheduler.requests[r2].is_finished()
     assert chunk.ref_cnt == 1
     assert job_id in connector._jobs
-    check_pressure_blocked("after-cancel")
 
     # 6. Finish the load: bytes restored, then R1 is released
-    pending = scheduler.schedule()
+    pending = schedule()
     assert not pending.num_scheduled_tokens
     assert not pending.kv_connector_metadata.load_jobs
     report(pending, wait_for={job_id})
+    assert end_event.query()
     loaded_blocks = first.kv_connector_metadata.load_jobs[job_id].dst_spec.block_ids
     for offset, block_id in enumerate(loaded_blocks):
         assert torch.equal(
             gpu[int(block_id)].cpu(), expected.reshape(3, page_bytes)[offset]
-        )
+        ), f"Restored GPU block {int(block_id)} differs from the seeded data"
     assert torch.equal(worker._load_handler.src_tensors[0], cpu_before)
+
+    if async_scheduling:
+        # 6a. The load is done on the worker, but the scheduler has not received the completion yet.
+        # The chunk must stay protected and R2 must wait
+        assert job_id in connector._jobs
+        assert chunk.ref_cnt == 1
+        assert keys[0] in connector._chunks_being_loaded
+        assert r1 in scheduler.requests
+        check_pressure_blocked("completion-in-flight")
+        lagged = schedule()  # schedules first, then applies the completion
+        assert not lagged.num_scheduled_tokens, (
+            "R2 ran before the load completion reached the scheduler"
+        )
+        assert not lagged.kv_connector_metadata.load_jobs
+        report(lagged)
+
     assert job_id not in connector._jobs
     assert chunk.ref_cnt == 0
     assert keys[0] not in connector._chunks_being_loaded
     assert r1 not in scheduler.requests
 
     # 7. Resume R2 and finish it with an injected EOS
-    for _ in range(4):
-        output = scheduler.schedule()
+    for _ in range(6):
+        output = schedule()
         loads = output.kv_connector_metadata.load_jobs
         if output.num_scheduled_tokens.get(r2, 0) > 0:
             assert not loads
@@ -248,13 +314,14 @@ def test_cancel_loader_while_same_prefix_request_waits(
                 token_id=EOS_TOKEN_ID,
                 kv_connector_worker_meta=actual.kv_connector_worker_meta,
             )
+            # EOS is applied immediately in both modes; only the transfer completion lag is modeled
             scheduler.update_from_output(output, model_output)
             assert survivor.is_finished()
             assert survivor.status != RequestStatus.FINISHED_ABORTED
 
             # 8. Drain pending stores; all state must be cleared
             for _ in range(8):
-                drained = scheduler.schedule()
+                drained = schedule()
                 assert not drained.num_scheduled_tokens
                 assert not drained.kv_connector_metadata.load_jobs
                 for job in connector._jobs.values():
@@ -269,6 +336,7 @@ def test_cancel_loader_while_same_prefix_request_waits(
                     break
             else:
                 raise AssertionError("Request/job state did not drain")
+            flush()
             assert not connector._chunks_being_loaded
             assert not connector._block_id_to_pending_jobs
             assert not connector.has_pending_push_work()
@@ -286,4 +354,57 @@ def test_cancel_loader_while_same_prefix_request_waits(
         for jid in loads:
             assert connector._jobs[jid].req_id == r2
         report(output, wait_for=set(loads))
-    raise AssertionError("R2 did not resume within four controlled steps")
+    raise AssertionError("R2 did not resume within six controlled steps")
+
+
+# Negative controls: each injects one fault and expects a specific check to fail
+
+
+def _release_early(*, manager, state, keys, **_):
+    # Bug: release R1's hold on the chunk at abort instead of when the load completes
+    manager.complete_load(keys, state.req_context)
+
+
+def _overwrite_cpu_chunk(*, worker, job_id, **_):
+    # Simulate the CPU chunk being overwritten before the load reads it.
+    # Require the Triton path so the stream wait gates CPU-memory reads.
+    handler = worker._load_handler
+    if getattr(handler._swap_blocks_batch, "func", None) is not triton_swap_blocks_batch:
+        pytest.skip("Load does not use the Triton path; CPU read timing is unordered")
+    transfer = next(t for t in handler._transfers if t.job_id == job_id)
+    if transfer.start_event.query():
+        pytest.skip("R1 load started before the overwrite")
+    handler.src_tensors[0].fill_(-1)
+    if transfer.start_event.query():
+        pytest.skip("R1 load may have started during the overwrite")
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_detects_early_release_of_loading_chunk(
+    request_runner, async_scheduling, request, monkeypatch
+):
+    # Bookkeeping only, so the memory mode does not matter
+    with pytest.raises(AssertionError, match="evicted the in-flight chunk"):
+        _run_cancel_scenario(
+            request_runner,
+            async_scheduling,
+            request,
+            monkeypatch,
+            pin_memory=False,
+            mutation=_release_early,
+        )
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_detects_overwrite_of_loading_chunk(
+    request_runner, async_scheduling, request, monkeypatch
+):
+    with pytest.raises(AssertionError, match="differs from the seeded data"):
+        _run_cancel_scenario(
+            request_runner,
+            async_scheduling,
+            request,
+            monkeypatch,
+            pin_memory=True,
+            mutation=_overwrite_cpu_chunk,
+        )
