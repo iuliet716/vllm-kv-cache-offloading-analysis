@@ -21,6 +21,8 @@ These experiments check completion reporting and cleanup.**
 ### [GPU–CPU Transfers](experiments/check_transfer.py)
 Seed a prompt, apply GPU cache pressure, and reuse the prompt to check whether its offloaded KV cache is loaded back from CPU. Checks transfer counters against expected KV-cache bytes and compares generated outputs.
 
+**Result:** 112 MiB of KV cache was stored to CPU and loaded back on prefix reuse; the reused request produced the same output.
+
 ### [Completion Reporting](experiments/test_completion_delivery.py)
 Vary completion order and metadata read timing with a mocked transfer engine to check for missing or duplicate completion metadata.
 
