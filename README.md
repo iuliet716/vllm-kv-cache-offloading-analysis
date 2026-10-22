@@ -4,6 +4,17 @@ Experiments on GPU–CPU KV-cache transfers and the request lifecycle in vLLM.
 
 Tested with [vLLM](https://github.com/vllm-project/vllm) `0.30.1rc1.dev740+gaad4579bb` (development build).
 
+## Motivation
+
+KV-cache offloading involves asynchronous transfers that can outlive a request.  
+These experiments check basic offloading behavior, completion reporting, and resource cleanup:
+
+1. **Baseline:** When a prompt's KV cache is evicted from GPU memory, is it loaded back from CPU when the prompt is reused?
+2. **Completion:** Are completions reported without omissions or duplicates across different arrival orders and read timings?
+3. **Cancellation:** If a request is canceled while loading KV cache, is the CPU data kept safe for another request waiting on the same prefix?
+
+**Summary:** In the tested scenarios for (2) and (3), completions were reported once, in-flight data stayed protected, and cleanup completed.
+
 ## Experiments
 
 ### [GPU–CPU Transfers](experiments/check_transfer.py)
