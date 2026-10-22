@@ -6,8 +6,9 @@ Tested with [vLLM](https://github.com/vllm-project/vllm) `0.30.1rc1.dev740+gaad4
 
 ## Motivation
 
-KV-cache offloading involves asynchronous transfers that can outlive a request.  
-These experiments check basic offloading behavior, completion reporting, and resource cleanup:
+**KV-cache offloading involves asynchronous transfers that can outlive a request.  
+Missing completion reports or early cleanup could leave requests waiting or data unprotected.  
+These experiments check completion reporting and cleanup.**
 
 1. **Baseline:** When a prompt's KV cache is evicted from GPU memory, is it loaded back from CPU when the prompt is reused?
 2. **Completion:** Are completions reported without omissions or duplicates across different arrival orders and read timings?
@@ -28,7 +29,7 @@ Vary completion order and metadata read timing with a mocked transfer engine to 
 ### [Cancellation & Cleanup](experiments/test_connector_cancel.py)
 Cancel request R1 during a load while request R2 waits on the same prefix, and apply CPU cache pressure before and after cancellation. Runs with synchronous and asynchronous scheduling; skips if the load finishes before or during cancellation.
 
-**Result:** In both modes, without skips, the in-flight CPU chunk remained protected from eviction and the restored GPU bytes matched the original data. R2 resumed and finished normally after an injected EOS, and all request and transfer state was cleared once pending stores completed.
+**Result:** Both modes passed without skips, the in-flight CPU chunk remained protected from eviction and the restored GPU bytes matched the original data. R2 resumed and finished normally after an injected EOS, and the checked request and transfer states was cleared once pending stores completed.
 
 ## Run
 
