@@ -7,7 +7,7 @@ import tempfile
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser()
     parser.add_argument("--vllm-dir", type=Path, required=True)
     parser.add_argument(
         "--experiment", choices=["cancel", "completion", "all"], default="all"
