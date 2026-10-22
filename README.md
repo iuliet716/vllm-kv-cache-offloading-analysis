@@ -36,7 +36,8 @@ Checks transfer counters against expected KV-cache bytes and compares generated 
 
 ### [Cancellation & Cleanup](experiments/test_connector_cancel.py)
 
-Cancel R1 while its load is pending and R2 waits on the same prefix. All tests run with sync and async scheduling.
+Cancel R1 while its load is pending and R2 waits on the same prefix.  
+Tests use both scheduler modes and model the one-step delay in transfer completion delivery for async scheduling.
 
 - `test_cancel_loader_while_same_prefix_request_waits`: The CPU chunk stays protected, GPU data is restored, and R2 finishes with an injected EOS before cleanup is verified. Runs with pinned and pageable CPU memory.
 - `test_detects_early_release_of_loading_chunk`: Detects an injected early chunk release.
@@ -58,3 +59,9 @@ bash run_server.sh > server.log 2>&1
 # Once ready, run in another terminal
 python experiments/check_transfer.py --output results/transfer-01
 ```
+
+## Notes
+
+- Tests reuse vLLM’s upstream fixtures and helpers.
+- Completion tests simulate worker reports. Cancellation tests use real CUDA transfers with simulated model outputs; async coverage is limited to transfer-completion timing.
+- The baseline compares one generated token and does not measure performance.
