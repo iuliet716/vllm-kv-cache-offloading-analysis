@@ -43,7 +43,7 @@ def test_cancel_loader_while_same_prefix_request_waits(
 def _run_cancel_scenario(
     request_runner, async_scheduling, request, monkeypatch, pin_memory, mutation=None
 ):
-    # Small pinned loads use Triton when supported; otherwise they fall back to C++.
+    # At this size (3 descriptors), loads use the C++ batch copy in both memory modes; only the overwrite control forces the Triton kernel.
     # Both memory modes are tested for chunk protection and lifecycle.
     monkeypatch.setattr("vllm.v1.kv_offload.cpu.gpu_worker.PIN_MEMORY", pin_memory)
     runner = request_runner(
@@ -399,6 +399,9 @@ def test_detects_early_release_of_loading_chunk(
 def test_detects_overwrite_of_loading_chunk(
     request_runner, async_scheduling, request, monkeypatch
 ):
+    # Force the Triton kernel for this three-descriptor negative control.
+    # Otherwise the C++ batch copy runs with SRC_ACCESS_ORDER_ANY and may read CPU data before the stream reaches start_event.
+    monkeypatch.setattr("vllm.v1.kv_offload.cpu.swap_blocks_triton.MIN_N", 1)
     with pytest.raises(AssertionError, match="differs from the seeded data"):
         _run_cancel_scenario(
             request_runner,
