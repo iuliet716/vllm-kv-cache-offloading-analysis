@@ -23,7 +23,7 @@ def byte_counters(text):
     return totals
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8000")
     parser.add_argument("--output", type=Path, required=True,
                         help="New directory for this run; must not already exist")
