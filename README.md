@@ -7,21 +7,21 @@ Tested with [vLLM](https://github.com/vllm-project/vllm) `0.30.1rc1.dev740+gaad4
 ## Experiments
 
 ### [GPU–CPU Transfers](experiments/check_transfer.py)
-Seed a prompt, apply GPU cache pressure, and reuse the prompt to check whether offloaded KV-cache is loaded back from CPU.
-
+Seed a prompt, apply GPU cache pressure, and reuse the prompt to check whether its offloaded KV cache is loaded back from CPU. Checks transfer counters against expected KV-cache bytes and compares generated outputs.
 
 ### [Completion Reporting](experiments/test_completion_delivery.py)
-Vary completion order and metadata read timing to check for missing or duplicate completion reports.
+Vary completion order and metadata read timing with a mocked transfer engine to check for missing or duplicate completion metadata.
 
-**Result:** Each job’s completion metadata was consumed once, then cleared.
+**Result:** In all 6 cases, each job's completion metadata was consumed once, then cleared.
 
 ### [Cancellation & Cleanup](experiments/test_connector_cancel.py)
-Cancel request R1 during a load while request R2 waits on the same prefix, then apply CPU cache pressure.  
-Runs with synchronous and asynchronous scheduling; skips if the load finishes before or during cancellation.
+Cancel request R1 during a load while request R2 waits on the same prefix, and apply CPU cache pressure before and after cancellation. Runs with synchronous and asynchronous scheduling; skips if the load finishes before or during cancellation.
 
-**Result:** The in-flight CPU chunk remained protected from eviction. Restored GPU bytes matched the original data, R2 resumed, and request/transfer state was cleared after injected EOS and pending work completed.
+**Result:** In both modes, without skips, the in-flight CPU chunk remained protected from eviction and the restored GPU bytes matched the original data. R2 resumed and finished normally after an injected EOS, and all request and transfer state was cleared once pending stores completed.
 
 ## Run
+
+Requires a CUDA environment with the tested vLLM source checkout and `pytest`.
 
 ```bash
 # Connector tests
