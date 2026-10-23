@@ -10,6 +10,9 @@ Python 3.12.15, pytest 9.1.1, PyTorch 2.13.0, NVIDIA RTX 5090, WSL2.
 **KV-cache transfers run asynchronously and can outlive the request that started them.  
 A missed completion can leave a request waiting; early cleanup can leave data unprotected.**
 
+**This project tests whether vLLM's CPU offloading avoids both failures,  
+using its real scheduler, offloading manager, and transfer worker.**
+
 1. **Baseline:** Is evicted KV cache loaded back from CPU when a prompt is reused?
 2. **Completion:** Is each transfer reported once per worker, and are stale reports ignored after a cache reset?
 3. **Cancellation:** If a request is canceled mid-load, is the CPU data safe for a request waiting on the same prefix?
